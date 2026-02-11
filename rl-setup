@@ -11,14 +11,41 @@
 #   configuration, desktop environment installation, and domain enrollment.
 #
 # Usage:
-#   Local:  sudo ./rocky-setup.sh
-#   Remote: ssh -t <host> "$(<./rocky-setup.sh)"
+#   Local:  sudo rl-setup
+#   Remote: rl-setup [options] <[user@]host>
+#
+#   Options:
+#     -p <port>           SSH port (default: 22)
+#     -i <identity_file>  SSH private key file
+#
+#   Examples:
+#     rl-setup myhost                              # connects as root@myhost
+#     rl-setup admin@myhost                        # connects as admin@myhost
+#     rl-setup -p 2222 myhost                      # custom port
+#     rl-setup -i ~/.ssh/mykey -p 2222 myhost      # custom key and port
 #
 # Requirements:
 #   - Rocky Linux 8 or 9
 #   - Root privileges
 #   - Network connectivity (for package installation)
 #===============================================================================
+
+# Remote execution mode: if arguments are given, SSH to the host and run this script
+if [[ $# -ge 1 ]]; then
+    SSH_OPTS=()
+    while [[ $# -gt 1 ]]; do
+        case "$1" in
+            -p) SSH_OPTS+=(-p "$2"); shift 2 ;;
+            -i) SSH_OPTS+=(-i "$2"); shift 2 ;;
+             *) echo "Unknown option: $1"; exit 1 ;;
+        esac
+    done
+    HOST="$1"
+    [[ "$HOST" != *@* ]] && HOST="root@$HOST"
+    SCRIPT_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+    ssh -t "${SSH_OPTS[@]}" "$HOST" "$(< "$SCRIPT_PATH")"
+    exit $?
+fi
 
 # Colors for terminal output
 Red=$(tput setaf 1)
@@ -96,14 +123,12 @@ EPEL_MIRRORS["AE"]="http://dl.fedoraproject.org/pub/epel"
 #BASE_MIRRORS["AE"]="https://mirror.ourhost.az/rockylinux/"
 #EPEL_MIRRORS["AE"]="https://mirror.yer.az/fedora-epel/"
 
-tmp_file=$(mktemp /tmp/rocky-setup.XXXXXX)
 trap cleanup_existing EXIT
 
 function cleanup_existing() {
+    trap - EXIT
     echo ""
     echo -e "${Dim}Cleaning up and exiting...${Reset}"
-    rm -f "$tmp_file"
-    exit 0
 }
 
 function download_apps() {
@@ -2037,9 +2062,6 @@ function create_bond_interface() {
         # Check for return option
         if [[ "$bond_name" == "0" ]]; then
             return
-        fi
-        if [[ "$bond_name" == "0" ]]; then
-            return
         elif [[ ! "$bond_name" =~ ^bond[0-9]+$ ]]; then
             print_warn "Bond name format: bondX (e.g., bond0, bond1)"
             continue
@@ -3228,7 +3250,7 @@ function main() {
         
         case $menu_index in
             0) initialization;;
-            1) yum_configure_mirror;;
+            1) update_mirrors;;
             2) install_desktop;;
             3) install_devtools;;
             4) install_remote_desktop;;
