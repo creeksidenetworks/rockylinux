@@ -75,20 +75,32 @@ print_step() {
     echo -e "${Dim}$(printf '─%.0s' $(seq 1 50))${Reset}"
 }
 
+LOG_FILE="/var/log/rl-setup.log"
+
+log() {
+    local level="${1:-INFO}"
+    local message="$2"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$level] $message" >> "$LOG_FILE"
+}
+
 print_ok() {
     echo -e "  ${Green}✓${Reset} $1"
+    log "DONE" "$1"
 }
 
 print_warn() {
     echo -e "  ${Yellow}⚠${Reset} $1"
+    log "WARN" "$1"
 }
 
 print_error() {
     echo -e "  ${Red}✗${Reset} $1"
+    log "ERROR" "$1"
 }
 
 print_info() {
     echo -e "  ${Blue}ℹ${Reset} $1"
+    log "INFO" "$1"
 }
 
 print_summary() {
@@ -118,8 +130,8 @@ BASE_MIRRORS["CN"]="https://mirrors.nju.edu.cn"
 EPEL_MIRRORS["CN"]="https://mirrors.nju.edu.cn/epel"
 BASE_MIRRORS["GB"]="http://rockylinux.mirrorservice.org"
 EPEL_MIRRORS["GB"]="https://www.mirrorservice.org/pub/epel"
-BASE_MIRRORS["AE"]="http://dl.rockylinux.org"
-EPEL_MIRRORS["AE"]="http://dl.fedoraproject.org/pub/epel"
+BASE_MIRRORS["AE"]="https://sa.mirrors.cicku.me"
+EPEL_MIRRORS["AE"]="https://sa.mirrors.cicku.me/epel"
 #BASE_MIRRORS["AE"]="https://mirror.ourhost.az/rockylinux/"
 #EPEL_MIRRORS["AE"]="https://mirror.yer.az/fedora-epel/"
 
@@ -129,6 +141,7 @@ function cleanup_existing() {
     trap - EXIT
     echo ""
     echo -e "${Dim}Cleaning up and exiting...${Reset}"
+    exit 0
 }
 
 function download_apps() {
@@ -272,7 +285,7 @@ function yum_configure_mirror() {
 
     # Detect if this is NJU mirror which has different path structure
     is_nju_mirror=0
-    if [[ "$baseos_url" =~ mirrors.nju.edu.cn ]]; then
+    if [[ "$baseos_url" =~ mirrors.nju.edu.cn ]] || [[ "$baseos_url" =~ mirrors.cicku.me ]]; then
         is_nju_mirror=1
     fi
 
@@ -467,7 +480,14 @@ EOF
     fi
 
     sudo setenforce 0 2>/dev/null || true
-    sudo sed -i 's/^SELINUX=.*/SELINUX=disabled/' /etc/selinux/config
+    if [[ -f /etc/default/grub ]] && ! sudo grep -q 'selinux=0' /etc/default/grub; then
+        sudo sed -i 's/\(GRUB_CMDLINE_LINUX="[^"]*\)"/\1 selinux=0"/' /etc/default/grub
+        if [[ -d /sys/firmware/efi ]]; then
+            sudo grub2-mkconfig -o /boot/efi/EFI/rocky/grub.cfg &>/dev/null || true
+        else
+            sudo grub2-mkconfig -o /boot/grub2/grub.cfg &>/dev/null || true
+        fi
+    fi
     print_ok "SELinux disabled"
 
     #---------------------------------------------------------------------------
@@ -531,7 +551,8 @@ EOF
     #---------------------------------------------------------------------------
     
     local default_packages=(
-        "zsh" "ksh" "tcsh" "xterm" "ethtool" "vim"
+        "zsh" "ksh" "tcsh" "xterm" "ethtool" "vim" 
+        "NetworkManager" "NetworkManager-tui" "net-tools"
         "yum-utils" "util-linux" "tree" "ncurses" 
         "nano" "ed" "fontconfig" "nedit" "htop" "pwgen"
         "nfs-utils" "cifs-utils" "samba-client" "autofs" 
@@ -579,25 +600,17 @@ EOF
             print_ok "SELinux set to permissive (current session)"
         fi
         
-        # Disable permanently in config
-        if [[ -f /etc/selinux/config ]]; then
-            sed -i 's/^SELINUX=enforcing/SELINUX=disabled/' /etc/selinux/config
-            sed -i 's/^SELINUX=permissive/SELINUX=disabled/' /etc/selinux/config
-            print_ok "SELinux disabled in config (will be disabled after reboot)"
-        else
-            # Create SELinux config directory and file
-            mkdir -p /etc/selinux
-            cat > /etc/selinux/config <<EOF
-SELINUX=disabled
-SELINUXTYPE=targeted
-EOF
-            print_ok "SELinux config created and set to disabled"
-        fi
-        
-        # Disable SELinux at boot via kernel command line
-        if command -v grubby &>/dev/null; then
-            grubby --update-kernel ALL --args selinux=0 &>/dev/null
-            print_ok "SELinux disabled at boot (kernel args)"
+        # Disable SELinux permanently via GRUB kernel args
+        if [[ -f /etc/default/grub ]]; then
+            if ! grep -q 'selinux=0' /etc/default/grub; then
+                sed -i 's/\(GRUB_CMDLINE_LINUX_DEFAULT="[^"]*\)"/\1 selinux=0"/' /etc/default/grub
+            fi
+            if [[ -d /sys/firmware/efi ]]; then
+                grub2-mkconfig -o /boot/efi/EFI/rocky/grub.cfg &>/dev/null
+            else
+                grub2-mkconfig -o /boot/grub2/grub.cfg &>/dev/null
+            fi
+            print_ok "SELinux disabled in GRUB (will be disabled after reboot)"
         fi
         
         # Prevent cloud-init from re-enabling SELinux
@@ -1126,6 +1139,7 @@ function enroll_domain() {
             --domain="$domain_name" \
             --principal="$admin_user" \
             --mkhomedir \
+            --enable-dns-updates \
             --force-join \
             --unattended; then
             print_ok "Joined $domain_name (FreeIPA)"
@@ -1137,10 +1151,10 @@ function enroll_domain() {
         #-----------------------------------------------------------------------
         print_step "3" "Configuring SSSD"
         #-----------------------------------------------------------------------
-        declare -A sssd_settings=(
-            ["ipa_dyndns_update"]="True"
-        )
-        update_sssd_settings
+        #declare -A sssd_settings=(
+        #    ["ipa_dyndns_update"]="True"
+        #)
+        #update_sssd_settings
 
         echo ""
         echo -e "${Green}${Bold}✓ FreeIPA enrollment completed${Reset}"
@@ -1164,9 +1178,9 @@ function enroll_domain() {
             ["ad_gpo_access_control"]="disabled"
             ["ad_gpo_map_remote_interactive"]="+xrdp-sesman"
             ["default_shell"]="/bin/bash"
-            ["dyndns_update"]="True"
-            ["dyndns_refresh_interval"]="43200"
-            ["dyndns_update_ptr"]="True"
+        #    ["dyndns_update"]="True"
+        #    ["dyndns_refresh_interval"]="43200"
+        #    ["dyndns_update_ptr"]="True"
         )
         update_sssd_settings
 
@@ -1451,7 +1465,7 @@ function install_eda_libraries() {
         "libmount-devel" "gperf" "webkit2gtk3" "webkit2gtk3-devel"
         "libvpx" "libvpx-devel" "libwayland-client" "libwayland-server"
         "mariadb-server" "mariadb" "php" "php-cli" "php-common" "libqb"
-        "ipmitool" "vsftpd" "links" "ntfs-3g" "gc" "gc-devel"
+        "ipmitool" "vsftpd" "links" "ntfs-3g" "gc" "gc-devel" "verilator"
     )
 
     print_info "Installing ${#eda_packages[@]} EDA packages..."
