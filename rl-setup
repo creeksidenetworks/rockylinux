@@ -274,7 +274,7 @@ function yum_configure_mirror() {
         select_mirror_country
     fi
 
-    echo "  Configuring yum repositories for $COUNTRY"
+    print_info "Configuring yum repositories for $COUNTRY"
     baseos_url="${BASE_MIRRORS[$COUNTRY]}"
     epel_url="${EPEL_MIRRORS[$COUNTRY]}"
     
@@ -358,6 +358,7 @@ function yum_configure_mirror() {
         if grep -q "epel-cisco-openh264" "$repo"; then
             sed -i -E 's|^#?baseurl=.*|baseurl=http://codecs.fedoraproject.org/openh264/$releasever/$basearch/|' "$repo"
             sed -i -E 's/^(metalink=.*)/#\1/' "$repo"
+            sed -i -E 's/^enabled=.*/enabled=0/' "$repo"
         else
             # Standard EPEL repos
             sed -i -E 's|^#?baseurl=.*|baseurl='"${epel_url}"'/$releasever/Everything/$basearch/|' "$repo"
@@ -373,18 +374,36 @@ function install_applications() {
     local installed=0
     local failed=0
     local skipped=0
-    
+
     for package in "${packages[@]}"; do
-        if rpm -q --quiet "$package" 2>/dev/null; then
-            ((skipped++))
-        elif dnf install -yq "$package" &>/dev/null; then
-            ((installed++))
+        # For dnf groups (@...), check via group list; for regular packages use rpm
+        local already_installed=false
+        if [[ "$package" == @* ]]; then
+            local group_name="${package:1}"
+            dnf group list --installed 2>/dev/null | grep -qi "$group_name" && already_installed=true
         else
-            print_warn "Failed: $package"
-            ((failed++))
+            rpm -q --quiet "$package" 2>/dev/null && already_installed=true
+        fi
+
+        if $already_installed; then
+            printf "  ${Yellow}-${Reset} %-38s${Yellow}[skipped]${Reset}\n" "$package"
+            ((skipped++))
+        else
+            local dnf_output
+            dnf_output=$(dnf install -yq --setopt=skip_if_unavailable=True "$package" 2>&1)
+            if [[ $? -eq 0 ]]; then
+                printf "  ${Green}✓${Reset} %-38s${Green}[installed]${Reset}\n" "$package"
+                ((installed++))
+            else
+                printf "  ${Red}✗${Reset} %-38s${Red}[failed]${Reset}\n" "$package"
+                local error_line
+                error_line=$(echo "$dnf_output" | grep -iE "^Error|No match for|nothing provides" | head -1 | sed 's/^ *//')
+                [[ -n "$error_line" ]] && printf "    ${Red}↳ %s${Reset}\n" "$error_line"
+                ((failed++))
+            fi
         fi
     done
-    
+
     local summary="Installed: $installed"
     [[ $skipped -gt 0 ]] && summary+=", Skipped: $skipped"
     [[ $failed -gt 0 ]] && summary+=", Failed: $failed"
@@ -550,12 +569,15 @@ EOF
     print_step "4" "Installing Essential Packages"
     #---------------------------------------------------------------------------
     
+    # Enable ruby:3.0 and nodejs:14 modules before package install
+    dnf -y module enable ruby:3.0 nodejs:14 &>/dev/null || true
+
     local default_packages=(
-        "zsh" "ksh" "tcsh" "xterm" "ethtool" "vim" 
+        "zsh" "ksh" "tcsh" "xterm" "ethtool" "vim-enhanced"
         "NetworkManager" "NetworkManager-tui" "net-tools"
-        "yum-utils" "util-linux" "tree" "ncurses" 
+        "yum-utils" "util-linux" "tree" "ncurses"
         "nano" "ed" "fontconfig" "nedit" "htop" "pwgen"
-        "nfs-utils" "cifs-utils" "samba-client" "autofs" 
+        "nfs-utils" "cifs-utils" "samba-client" "autofs"
         "subversion" "ansible" "git"
         "iperf3" "traceroute" "mtr" "rsnapshot"
         "tar"  "zip" "unzip" "p7zip" "p7zip-plugins" "cabextract"
@@ -563,13 +585,37 @@ EOF
         "telnet" "jq"  "lsof" "bind-utils" "tcpdump" "net-tools"
         "openssl" "cyrus-sasl" "cyrus-sasl-plain" "cyrus-sasl-ldap"
         "openldap-clients" "ipa-client"
-        "sssd" "realmd" "oddjob" "oddjob-mkhomedir"
+        "sssd" "sssd-tools" "authselect" "realmd" "oddjob" "oddjob-mkhomedir"
         "adcli" "samba-common" "samba-common-tools" "krb5-workstation"
         "firewalld" "dnf-plugins-core" "policycoreutils-python-utils"
+        "bash-completion"
+        "@Development Tools"
+        "munge" "munge-devel"
+        "bzip2"
+        "readline-devel" "numactl-devel" "pam-devel" "glib2-devel" "hwloc-devel"
+        "openssl-devel" "libcurl-devel" "mariadb-devel" "mariadb"
+        "python3-numpy"
+        "kitty-terminfo" "stress" "pcp"
     )
+
+    # Version-specific packages
+    if [[ "$os_version" == "8" ]]; then
+        default_packages+=("python39" "python39-devel" "libcgroup")
+    else
+        default_packages+=("python3-devel")
+    fi
 
     print_info "Installing ${#default_packages[@]} packages..."
     install_applications "${default_packages[@]}"
+
+    # Set Python 3.9 as default
+    if command -v python3.9 &>/dev/null; then
+        alternatives --set python /usr/bin/python3.9 &>/dev/null || \
+            alternatives --install /usr/bin/python python /usr/bin/python3.9 10 &>/dev/null
+        alternatives --set python3 /usr/bin/python3.9 &>/dev/null || \
+            alternatives --install /usr/bin/python3 python3 /usr/bin/python3.9 10 &>/dev/null
+        print_ok "Python default set to $(python3.9 --version 2>&1)"
+    fi
 
     #---------------------------------------------------------------------------
     print_step "5" "Configuring Firewall"
@@ -632,7 +678,75 @@ EOF
     fi
 
     #---------------------------------------------------------------------------
-    print_step "7" "Update Root Password (Optional)"
+    print_step "7" "Expand Boot Disk (Optional)"
+    #---------------------------------------------------------------------------
+
+    _root_source=$(findmnt -n -o SOURCE /)
+    _is_lvm=false
+    _pv_part=""
+
+    if [[ "$_root_source" == /dev/mapper/* ]]; then
+        _pv_part=$(pvs --noheadings -o pv_name 2>/dev/null | awk '{print $1}' | head -1)
+        _is_lvm=true
+    else
+        _pv_part="$_root_source"
+    fi
+
+    if [[ -n "$_pv_part" && -b "$_pv_part" ]] && command -v parted &>/dev/null; then
+        _disk=$(lsblk -ndo pkname "$_pv_part" 2>/dev/null)
+        _disk_dev="/dev/$_disk"
+        _part_num=$(echo "$_pv_part" | grep -o '[0-9]*$')
+
+        if [[ -b "$_disk_dev" ]]; then
+            _free_mb=$(parted "$_disk_dev" unit MB print free 2>/dev/null | \
+                       awk '/Free Space/{gsub(/MB/,"",$3); if ($3+0 > 1024) print $3+0}' | tail -1)
+
+            if [[ -n "$_free_mb" ]]; then
+                _free_gb=$(awk "BEGIN {printf \"%.1f\", $_free_mb / 1024}")
+                echo ""
+                print_info "Detected ${_free_gb}GB of unallocated space on $_disk_dev"
+                read -p "  Expand to use this space? [y/N]: " _expand_disk
+
+                if [[ "$_expand_disk" =~ ^[Yy]$ ]]; then
+                    print_info "Expanding partition $_part_num on $_disk_dev..."
+                    if growpart "$_disk_dev" "$_part_num" &>/dev/null; then
+                        print_ok "Partition $_part_num expanded"
+
+                        if $_is_lvm; then
+                            pvresize "$_pv_part" &>/dev/null
+                            _lv=$(lvs --noheadings -o lv_path 2>/dev/null | awk '{print $1}' | grep -v swap | head -1)
+                            if [[ -n "$_lv" ]]; then
+                                lvextend -l +100%FREE "$_lv" &>/dev/null
+                                _fs_type=$(findmnt -n -o FSTYPE /)
+                                if [[ "$_fs_type" == "xfs" ]]; then
+                                    xfs_growfs / &>/dev/null && print_ok "XFS filesystem expanded"
+                                else
+                                    resize2fs "$_lv" &>/dev/null && print_ok "ext4 filesystem expanded"
+                                fi
+                            fi
+                        else
+                            _fs_type=$(findmnt -n -o FSTYPE /)
+                            if [[ "$_fs_type" == "xfs" ]]; then
+                                xfs_growfs / &>/dev/null && print_ok "XFS filesystem expanded"
+                            else
+                                resize2fs "$_root_source" &>/dev/null && print_ok "ext4 filesystem expanded"
+                            fi
+                        fi
+                        print_ok "Disk expansion completed"
+                    else
+                        print_warn "Could not expand partition (no free space or already at maximum)"
+                    fi
+                fi
+            else
+                print_ok "No significant unallocated space detected on $_disk_dev"
+            fi
+        fi
+    else
+        print_info "Skipping disk expansion check (parted not available)"
+    fi
+
+    #---------------------------------------------------------------------------
+    print_step "8" "Update Root Password (Optional)"
     #---------------------------------------------------------------------------
     
     echo ""
