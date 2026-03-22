@@ -36,8 +36,36 @@ while [[ -L "$SOURCE" ]]; do
 done
 SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
 
-# Source shared lib for local UI (colors, show_menu, print_*)
-source "$SCRIPT_DIR/rockylinux/rl_lib.sh"
+# Local UI helpers (colors, print_*, show_menu) — no bash4/root required
+Red=$(tput setaf 1 2>/dev/null); Green=$(tput setaf 2 2>/dev/null)
+Yellow=$(tput setaf 3 2>/dev/null); Blue=$(tput setaf 4 2>/dev/null)
+Cyan=$(tput setaf 6 2>/dev/null); Bold=$(tput bold 2>/dev/null)
+Reset=$(tput sgr0 2>/dev/null); Dim=$(tput dim 2>/dev/null)
+
+print_ok()    { echo -e "  ${Green}✓${Reset} $1"; }
+print_info()  { echo -e "  ${Blue}ℹ${Reset} $1"; }
+print_error() { echo -e "  ${Red}✗${Reset} $1"; }
+print_warn()  { echo -e "  ${Yellow}⚠${Reset} $1"; }
+
+show_menu() {
+    local title="$1"; shift
+    local default_choice=0
+    [[ "$1" =~ ^[0-9]+$ ]] && { default_choice=$1; shift; }
+    local options=("$@")
+    echo ""
+    echo -e "${Green}${Bold}$title${Reset}"
+    for i in "${!options[@]}"; do
+        printf "  ${Cyan}%d)${Reset} %s\n" "$((i+1))" "${options[$i]}"
+    done
+    echo ""
+    [[ $default_choice -gt 0 ]] && echo -n "  Select [$default_choice]: " || echo -n "  Select: "
+    read user_choice
+    [[ -z "$user_choice" ]] && user_choice=$default_choice
+    if ! [[ "$user_choice" =~ ^[0-9]+$ ]] || (( user_choice < 1 || user_choice > ${#options[@]} )); then
+        user_choice=$(( default_choice > 0 ? default_choice : ${#options[@]} ))
+    fi
+    menu_index=$(( user_choice - 1 ))
+}
 
 SSH_OPTS=()
 TARGET=""
