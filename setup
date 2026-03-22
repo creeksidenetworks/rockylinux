@@ -1,0 +1,143 @@
+#!/bin/bash
+#===============================================================================
+# Universal Linux Setup Utility - Remote Controller
+# Version: 1.0
+# Author: Jackson Tong / Creekside Networks LLC
+# License: MIT
+#
+# Description:
+#   Universal setup and configuration utility for Linux servers.
+#   Detects the remote OS and runs the appropriate sub-scripts via SSH.
+#
+# Supported OS:
+#   - Rocky Linux 8, 9
+#   - Ubuntu (planned)
+#
+# Usage:
+#   setup [options] <[user@]host>
+#
+#   Options:
+#     -p <port>           SSH port (default: 22)
+#     -i <identity_file>  SSH private key file
+#
+#   Examples:
+#     setup myhost                              # connects as root@myhost
+#     setup admin@myhost                        # connects as admin@myhost
+#     setup -p 2222 myhost                      # custom port
+#     setup -i ~/.ssh/mykey -p 2222 myhost      # custom key and port
+#===============================================================================
+
+# Resolve symlinks to find real script directory
+SOURCE="${BASH_SOURCE[0]}"
+while [[ -L "$SOURCE" ]]; do
+    DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+    SOURCE="$(readlink "$SOURCE")"
+    [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+
+# Source shared lib for local UI (colors, show_menu, print_*)
+source "$SCRIPT_DIR/rockylinux/rl_lib.sh"
+
+SSH_OPTS=()
+TARGET=""
+
+# Parse arguments: [-p port] [-i keyfile] [user@]host
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -p) SSH_OPTS+=(-p "$2"); shift 2 ;;
+        -i) SSH_OPTS+=(-i "$2"); shift 2 ;;
+        *)  TARGET="$1"; shift ;;
+    esac
+done
+
+if [[ -z "$TARGET" ]]; then
+    TARGET="root@localhost"
+fi
+[[ "$TARGET" != *@* ]] && TARGET="root@$TARGET"
+
+# Detect OS on the remote host
+detect_remote_os() {
+    REMOTE_OS=$(ssh "${SSH_OPTS[@]}" "$TARGET" \
+        "grep '^ID=' /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '\"'" 2>/dev/null)
+    REMOTE_OS_VERSION=$(ssh "${SSH_OPTS[@]}" "$TARGET" \
+        "grep '^VERSION_ID=' /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '\"' | cut -d. -f1" 2>/dev/null)
+}
+
+# Configure OS-specific script paths and menu-to-script mapping
+configure_os() {
+    case "$REMOTE_OS" in
+        rocky)
+            if [[ "$REMOTE_OS_VERSION" != "8" && "$REMOTE_OS_VERSION" != "9" ]]; then
+                print_error "Rocky Linux $REMOTE_OS_VERSION is not supported (supported: 8, 9)"
+                exit 1
+            fi
+            OS_LABEL="Rocky Linux $REMOTE_OS_VERSION"
+            SCRIPTS_DIR="$SCRIPT_DIR/rockylinux"
+            LIB_FILE="rl_lib.sh"
+            MENU_SCRIPTS=(
+                "rl_initialization.sh"
+                "rl_update_mirrors.sh"
+                "rl_install_desktop.sh"
+                "rl_install_devtools.sh"
+                "rl_install_remote_desktop.sh"
+                "rl_update_network_settings.sh"
+                "rl_enroll_domain.sh"
+            )
+            ;;
+        ubuntu)
+            print_error "Ubuntu support is not yet available"
+            exit 1
+            ;;
+        *)
+            print_error "Unsupported OS: '${REMOTE_OS:-unknown}'. Supported: Rocky Linux 8/9"
+            exit 1
+            ;;
+    esac
+}
+
+# Run a sub-script on the remote target
+run_remote() {
+    local script_name="${MENU_SCRIPTS[$1]}"
+    ssh -t "${SSH_OPTS[@]}" "$TARGET" "$(cat "$SCRIPTS_DIR/$LIB_FILE" "$SCRIPTS_DIR/$script_name")"
+}
+
+# Banner
+echo ""
+echo -e "${Cyan}╔═══════════════════════════════════════════════════════════╗${Reset}"
+echo -e "${Cyan}║${Reset}  ${Bold}Linux Setup Utility${Reset}                                      ${Cyan}║${Reset}"
+echo -e "${Cyan}║${Reset}  Version 1.0                                              ${Cyan}║${Reset}"
+echo -e "${Cyan}║${Reset}  (c) 2021-2025 Creekside Networks LLC                     ${Cyan}║${Reset}"
+echo -e "${Cyan}╚═══════════════════════════════════════════════════════════╝${Reset}"
+echo ""
+echo -e "  Target: ${Green}${Bold}$TARGET${Reset}"
+
+print_info "Detecting remote OS..."
+detect_remote_os
+configure_os
+print_ok "Detected: $OS_LABEL"
+
+# Main menu loop
+while true; do
+    menu_items=(
+        "System Initialization"
+        "Update Repository Mirrors"
+        "Install Desktop Environment"
+        "Install Development Tools"
+        "Install Remote Desktop"
+        "Configure Network"
+        "Join Domain (AD/FreeIPA)"
+        "Exit"
+    )
+    show_menu "Main Menu" 8 "${menu_items[@]}"
+    case $menu_index in
+        0) run_remote 0 ;;
+        1) run_remote 1 ;;
+        2) run_remote 2 ;;
+        3) run_remote 3 ;;
+        4) run_remote 4 ;;
+        5) run_remote 5 ;;
+        6) run_remote 6 ;;
+        7) echo "Goodbye."; exit 0 ;;
+    esac
+done
