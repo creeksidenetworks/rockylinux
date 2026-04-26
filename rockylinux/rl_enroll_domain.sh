@@ -163,12 +163,29 @@ function enroll_domain() {
             print_warn "Password cannot be empty"
         done
 
+        # NTP option — only relevant for FreeIPA; default to skip in containers
+        skip_ntp_setup=false
+        if [[ "$domain_type" == "FreeIPA" ]]; then
+            local ntp_default="N"
+            local ntp_hint=""
+            if [[ "$IS_LXC_CONTAINER" == "true" ]]; then
+                ntp_default="Y"
+                ntp_hint=" (container detected — recommended)"
+            fi
+            read -p "  Skip NTP/chrony setup?${ntp_hint} [${ntp_default}]: " ntp_input
+            [[ -z "$ntp_input" ]] && ntp_input="$ntp_default"
+            [[ "$ntp_input" =~ ^[Yy]$ ]] && skip_ntp_setup=true
+        fi
+
         # Display summary
+        local ntp_label="N/A"
+        [[ "$domain_type" == "FreeIPA" ]] && ntp_label=$( [[ "$skip_ntp_setup" == "true" ]] && echo "skip" || echo "configure" )
         local summary_items=(
             "Hostname:    $fqdn_hostname"
             "Domain:      $domain_name"
             "Type:        $domain_type"
             "Admin User:  $admin_user"
+            "NTP Setup:   $ntp_label"
         )
         print_summary "Domain Join Configuration" "${summary_items[@]}"
 
@@ -187,6 +204,12 @@ function enroll_domain() {
     print_ok "Hostname set to $fqdn_hostname"
 
     if [[ "$domain_type" == "FreeIPA" ]]; then
+        local ipa_ntp_opts=()
+        if [[ "$skip_ntp_setup" == "true" ]]; then
+            ipa_ntp_opts+=(--no-ntp)
+            print_info "Skipping NTP/chrony configuration"
+        fi
+
         if ipa-client-install \
             -p "$admin_user" \
             -w "$admin_pass" \
@@ -196,7 +219,8 @@ function enroll_domain() {
             --mkhomedir \
             --enable-dns-updates \
             --force-join \
-            --unattended; then
+            --unattended \
+            "${ipa_ntp_opts[@]}"; then
             print_ok "Joined $domain_name (FreeIPA)"
         else
             print_error "Failed to join FreeIPA domain"

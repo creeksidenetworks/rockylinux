@@ -15,12 +15,15 @@
 #
 # Usage:
 #   setup [options] <[user@]host>
+#   setup --local
 #
 #   Options:
+#     --local             Configure this host directly (no SSH)
 #     -p <port>           SSH port (default: 22)
 #     -i <identity_file>  SSH private key file
 #
 #   Examples:
+#     setup --local                             # configure this host directly
 #     setup myhost                              # connects as root@myhost
 #     setup admin@myhost                        # connects as admin@myhost
 #     setup -p 2222 myhost                      # custom port
@@ -69,27 +72,68 @@ show_menu() {
 
 SSH_OPTS=()
 TARGET=""
+LOCAL_MODE=false
 
-# Parse arguments: [-p port] [-i keyfile] [user@]host
+# Parse arguments: [--local] [-p port] [-i keyfile] [user@]host
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --local) LOCAL_MODE=true; shift ;;
         -p) SSH_OPTS+=(-p "$2"); shift 2 ;;
         -i) SSH_OPTS+=(-i "$2"); shift 2 ;;
         *)  TARGET="$1"; shift ;;
     esac
 done
 
-if [[ -z "$TARGET" ]]; then
-    TARGET="root@localhost"
+if [[ "$LOCAL_MODE" != "true" ]]; then
+    if [[ -z "$TARGET" ]]; then
+        TARGET="root@localhost"
+    fi
+    [[ "$TARGET" != *@* ]] && TARGET="root@$TARGET"
 fi
-[[ "$TARGET" != *@* ]] && TARGET="root@$TARGET"
 
-# Detect OS on the remote host
+# Default options added to every SSH call:
+#   StrictHostKeyChecking=accept-new  — auto-accept unknown hosts; never silently fail on first connect
+#   ConnectTimeout=10                 — fail fast instead of hanging
+DEFAULT_SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o ConnectTimeout=10)
+
+# Verify SSH connectivity before attempting detection; give a clear error if it fails
+check_ssh_connectivity() {
+    local ssh_err
+    ssh_err=$(ssh "${DEFAULT_SSH_OPTS[@]}" "${SSH_OPTS[@]}" "$TARGET" "exit 0" 2>&1)
+    if [[ $? -ne 0 ]]; then
+        print_error "Cannot connect to $TARGET"
+        [[ -n "$ssh_err" ]] && echo -e "  ${Dim}$ssh_err${Reset}"
+        print_info "Verify SSH access manually:  ssh ${SSH_OPTS[*]} $TARGET"
+        exit 1
+    fi
+}
+
+# Detect OS on the remote host — single round-trip for all three values
 detect_remote_os() {
-    REMOTE_OS=$(ssh "${SSH_OPTS[@]}" "$TARGET" \
-        "grep '^ID=' /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '\"'" 2>/dev/null)
-    REMOTE_OS_VERSION=$(ssh "${SSH_OPTS[@]}" "$TARGET" \
-        "grep '^VERSION_ID=' /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '\"' | cut -d. -f1" 2>/dev/null)
+    local result
+    result=$(ssh "${DEFAULT_SSH_OPTS[@]}" "${SSH_OPTS[@]}" "$TARGET" '
+        ID=$(grep "^ID=" /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d "\"")
+        VER=$(grep "^VERSION_ID=" /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d "\"" | cut -d. -f1)
+        VIRT=$(systemd-detect-virt --container 2>/dev/null \
+               || cat /run/systemd/container 2>/dev/null \
+               || echo none)
+        echo "$ID $VER $VIRT"
+    ' 2>/dev/null)
+    read -r REMOTE_OS REMOTE_OS_VERSION _virt <<< "$result"
+    REMOTE_IS_LXC=false
+    [[ "$_virt" == "lxc" || "$_virt" == "lxc-libvirt" ]] && REMOTE_IS_LXC=true
+}
+
+# Detect OS locally (--local mode)
+detect_local_os() {
+    REMOTE_OS=$(grep '^ID=' /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '"')
+    REMOTE_OS_VERSION=$(grep '^VERSION_ID=' /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '"' | cut -d. -f1)
+    local _virt
+    _virt=$(systemd-detect-virt --container 2>/dev/null \
+            || cat /run/systemd/container 2>/dev/null \
+            || echo none)
+    REMOTE_IS_LXC=false
+    [[ "$_virt" == "lxc" || "$_virt" == "lxc-libvirt" ]] && REMOTE_IS_LXC=true
 }
 
 # Configure OS-specific script paths and menu-to-script mapping
@@ -101,6 +145,7 @@ configure_os() {
                 exit 1
             fi
             OS_LABEL="Rocky Linux $REMOTE_OS_VERSION"
+            [[ "$REMOTE_IS_LXC" == "true" ]] && OS_LABEL+=" (LXC Container)"
             SCRIPTS_DIR="$SCRIPT_DIR/rockylinux"
             LIB_FILE="rl_lib.sh"
             MENU_SCRIPTS=(
@@ -124,10 +169,14 @@ configure_os() {
     esac
 }
 
-# Run a sub-script on the remote target
+# Run a sub-script — locally or via SSH depending on mode
 run_remote() {
     local script_name="${MENU_SCRIPTS[$1]}"
-    ssh -t "${SSH_OPTS[@]}" "$TARGET" "$(cat "$SCRIPTS_DIR/$LIB_FILE" "$SCRIPTS_DIR/$script_name")"
+    if [[ "$LOCAL_MODE" == "true" ]]; then
+        bash <(cat "$SCRIPTS_DIR/$LIB_FILE" "$SCRIPTS_DIR/$script_name")
+    else
+        ssh -t "${DEFAULT_SSH_OPTS[@]}" "${SSH_OPTS[@]}" "$TARGET" "$(cat "$SCRIPTS_DIR/$LIB_FILE" "$SCRIPTS_DIR/$script_name")"
+    fi
 }
 
 # Banner
@@ -138,12 +187,25 @@ echo -e "${Cyan}║${Reset}  Version 1.0                                        
 echo -e "${Cyan}║${Reset}  (c) 2021-2025 Creekside Networks LLC                     ${Cyan}║${Reset}"
 echo -e "${Cyan}╚═══════════════════════════════════════════════════════════╝${Reset}"
 echo ""
-echo -e "  Target: ${Green}${Bold}$TARGET${Reset}"
 
-print_info "Detecting remote OS..."
-detect_remote_os
+if [[ "$LOCAL_MODE" == "true" ]]; then
+    echo -e "  Target: ${Green}${Bold}localhost (local)${Reset}"
+    if [[ $EUID -ne 0 ]]; then
+        print_error "Local mode requires root. Re-run with: sudo ./setup --local"
+        exit 1
+    fi
+    print_info "Detecting local OS..."
+    detect_local_os
+else
+    echo -e "  Target: ${Green}${Bold}$TARGET${Reset}"
+    print_info "Connecting to $TARGET..."
+    check_ssh_connectivity
+    print_info "Detecting remote OS..."
+    detect_remote_os
+fi
 configure_os
 print_ok "Detected: $OS_LABEL"
+[[ "$REMOTE_IS_LXC" == "true" ]] && print_warn "LXC container — firewalld, SELinux GRUB args, and disk expansion will be skipped"
 
 # Main menu loop
 while true; do

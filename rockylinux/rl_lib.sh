@@ -176,6 +176,35 @@ function show_menu() {
     menu_index=$((user_choice-1))
 }
 
+function detect_container() {
+    IS_LXC_CONTAINER=false
+    CONTAINER_TYPE="none"
+    local virt_type=""
+
+    if command -v systemd-detect-virt &>/dev/null; then
+        virt_type=$(systemd-detect-virt --container 2>/dev/null)
+    fi
+    if [[ -z "$virt_type" || "$virt_type" == "none" ]] && [[ -f /run/systemd/container ]]; then
+        virt_type=$(cat /run/systemd/container 2>/dev/null)
+    fi
+    # LXD sets container=lxc in PID 1's environment even when child processes
+    # don't inherit it; grep -a treats the null-byte separated file as text
+    if [[ -z "$virt_type" || "$virt_type" == "none" ]]; then
+        if grep -qa 'container=lxc' /proc/1/environ 2>/dev/null; then
+            virt_type="lxc"
+        fi
+    fi
+    if [[ -z "$virt_type" || "$virt_type" == "none" ]] && [[ "${container:-}" != "" ]]; then
+        virt_type="${container}"
+    fi
+
+    if [[ "$virt_type" == "lxc" || "$virt_type" == "lxc-libvirt" ]]; then
+        IS_LXC_CONTAINER=true
+        CONTAINER_TYPE="lxc"
+    fi
+    export IS_LXC_CONTAINER CONTAINER_TYPE
+}
+
 function detect_location() {
     GEOINFO=$(curl -s --max-time 5 http://ip-api.com/json/)
     if [[ -n "$GEOINFO" && "$GEOINFO" != "{}" ]]; then
@@ -364,3 +393,6 @@ function install_applications() {
     [[ $failed -gt 0 ]] && summary+=", Failed: $failed"
     print_ok "$summary"
 }
+
+# Auto-detect container environment at lib load time (after all functions defined)
+detect_container
